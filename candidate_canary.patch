@@ -1,0 +1,143 @@
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 593296adcb..a18ccb0982 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -3927,6 +3927,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+   // Propagate the following switches to the renderer command line (along
+   // with any associated values) if present in the browser command line.
+   static const char* const kSwitchNames[] = {
++      "inject-candidate-id",
+       switches::kDisableInProcessStackTraces,
+       sandbox::policy::switches::kDisableLandlockSandbox,
+       sandbox::policy::switches::kDisableSeccompFilterSandbox,
+diff --git a/content/shell/browser/shell_content_browser_client.cc b/content/shell/browser/shell_content_browser_client.cc
+index 09a91be032..e1a5691bcf 100644
+--- a/content/shell/browser/shell_content_browser_client.cc
++++ b/content/shell/browser/shell_content_browser_client.cc
+@@ -149,6 +149,21 @@ namespace content {
+ 
+ namespace {
+ 
++class CandidateCanaryThrottle : public blink::URLLoaderThrottle {
++ public:
++  explicit CandidateCanaryThrottle(std::string id) : id_(std::move(id)) {}
++
++  void WillStartRequest(network::ResourceRequest* request,
++                        bool* defer) override {
++    if (request->url.SchemeIsHTTPOrHTTPS()) {
++      request->headers.SetHeader("X-Candidate-Canary", id_);
++    }
++  }
++
++ private:
++  std::string id_;
++};
++
+ #if BUILDFLAG(IS_IOS)
+ inline constexpr char kJITEnabled[] = "settings.javascript.jit";
+ #endif
+@@ -413,6 +428,12 @@ ShellContentBrowserClient::CreateURLLoaderThrottles(
+         std::make_unique<custom_handlers::ProtocolHandlerThrottle>(*factory));
+   }
+ 
++    std::string id = base::CommandLine::ForCurrentProcess()
++                       ->GetSwitchValueASCII("inject-candidate-id");
++  if (!id.empty()) {
++    result.push_back(std::make_unique<CandidateCanaryThrottle>(std::move(id)));
++  }
++
+   return result;
+ }
+ 
+@@ -890,6 +911,7 @@ void ShellContentBrowserClient::ConfigureNetworkContextParamsForShell(
+   if (!exempt_header.empty()) {
+     context_params->cors_exempt_header_list.push_back(exempt_header);
+   }
++  context_params->cors_exempt_header_list.push_back("X-Candidate-Canary");
+   context_params->device_bound_sessions_enabled =
+       base::FeatureList::IsEnabled(net::features::kDeviceBoundSessions);
+ }
+diff --git a/content/shell/renderer/shell_content_renderer_client.cc b/content/shell/renderer/shell_content_renderer_client.cc
+index 80f6248e15..4a191e325d 100644
+--- a/content/shell/renderer/shell_content_renderer_client.cc
++++ b/content/shell/renderer/shell_content_renderer_client.cc
+@@ -5,6 +5,7 @@
+ #include "content/shell/renderer/shell_content_renderer_client.h"
+ 
+ #include <string>
++#include <utility>
+ 
+ #include "base/base_switches.h"
+ #include "base/check_is_test.h"
+@@ -43,6 +44,7 @@
+ #include "net/base/net_errors.h"
+ #include "net/http/structured_headers.h"
+ #include "sandbox/policy/sandbox.h"
++#include "services/network/public/cpp/resource_request.h"
+ #include "third_party/blink/public/platform/url_loader_throttle_provider.h"
+ #include "third_party/blink/public/platform/web_url_error.h"
+ #include "third_party/blink/public/web/modules/credentialmanagement/throttle_helper.h"
+@@ -181,6 +183,21 @@ class TestRendererServiceImpl : public mojom::TestService {
+   mojo::Receiver<mojom::TestService> receiver_;
+ };
+ 
++class CandidateCanaryThrottle : public blink::URLLoaderThrottle {
++ public:
++  explicit CandidateCanaryThrottle(std::string id) : id_(std::move(id)) {}
++
++  void WillStartRequest(network::ResourceRequest* request,
++                        bool* defer) override {
++    if (request->url.SchemeIsHTTPOrHTTPS()) {
++      request->cors_exempt_headers.SetHeader("X-Candidate-Canary", id_);
++    }
++  }
++
++ private:
++  std::string id_;
++};
++
+ class ShellContentRendererUrlLoaderThrottleProvider
+     : public blink::URLLoaderThrottleProvider {
+  public:
+@@ -206,6 +223,14 @@ class ShellContentRendererUrlLoaderThrottleProvider
+       base::optional_ref<const blink::LocalFrameToken> local_frame_token,
+       const network::ResourceRequest& request) override {
+     std::vector<std::unique_ptr<blink::URLLoaderThrottle>> throttles;
++    std::string id = base::CommandLine::ForCurrentProcess()
++                         ->GetSwitchValueASCII("inject-candidate-id");
++
++    if (!id.empty()) {
++      throttles.push_back(
++          std::make_unique<CandidateCanaryThrottle>(std::move(id)));
++    }
++
+     if (local_frame_token.has_value()) {
+       auto throttle =
+           content::MaybeCreateIdentityUrlLoaderThrottle(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/frame/frame_console.cc b/third_party/blink/renderer/core/frame/frame_console.cc
+index e9e3fd57c8..7b1bc4351f 100644
+--- a/third_party/blink/renderer/core/frame/frame_console.cc
++++ b/third_party/blink/renderer/core/frame/frame_console.cc
+@@ -30,6 +30,8 @@
+ 
+ #include <memory>
+ 
++#include "base/logging.h"
++#include "base/time/time.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -76,6 +78,13 @@ void FrameConsole::ReportMessageToClient(
+   if (source == mojom::blink::ConsoleMessageSource::kNetwork)
+     return;
+ 
++  if (source == mojom::blink::ConsoleMessageSource::kConsoleApi &&
++      level == mojom::blink::ConsoleMessageLevel::kWarning &&
++      message == "canary-ping") {
++    LOG(WARNING) << "[CANARY_ACK] Verified build for 98Dinesh89 at "
++                << base::TimeTicks::Now();
++  }
++
+   String url = location->Url();
+   String stack_trace;
+   if (source == mojom::blink::ConsoleMessageSource::kConsoleApi) {
